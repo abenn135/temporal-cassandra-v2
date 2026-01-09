@@ -31,6 +31,7 @@ import (
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/namespace/nsregistry"
 	commonnexus "go.temporal.io/server/common/nexus"
+	"go.temporal.io/server/common/ownership"
 	"go.temporal.io/server/common/persistence"
 	persistenceClient "go.temporal.io/server/common/persistence/client"
 	"go.temporal.io/server/common/persistence/serialization"
@@ -253,6 +254,7 @@ func ClientFactoryProvider(
 	persistenceConfig *config.Persistence,
 	logger log.SnTaggedLogger,
 	throttledLogger log.ThrottledLogger,
+	historyShardWatcher ownership.HistoryShardWatcher,
 ) client.Factory {
 	return factoryProvider.NewFactory(
 		rpcFactory,
@@ -263,6 +265,7 @@ func ClientFactoryProvider(
 		persistenceConfig.NumHistoryShards,
 		logger,
 		throttledLogger,
+		historyShardWatcher,
 	)
 }
 

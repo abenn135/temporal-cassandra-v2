@@ -40,6 +40,8 @@ import (
 	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/namespace"
 	"go.temporal.io/server/common/namespace/nsreplication"
+	"go.temporal.io/server/common/ownership"
+	"go.temporal.io/server/common/ownership/memberbased"
 	"go.temporal.io/server/common/persistence"
 	persistenceClient "go.temporal.io/server/common/persistence/client"
 	"go.temporal.io/server/common/persistence/visibility"
@@ -429,6 +431,7 @@ func (c *TemporalImpl) startFrontend() {
 			c.getFxOptionsForService(primitives.FrontendService),
 			chasm.Module,
 			chasmtests.Module,
+			memberbased.Module,
 		)
 		err := app.Err()
 		if err != nil {
@@ -531,6 +534,7 @@ func (c *TemporalImpl) startHistory() {
 			fx.Populate(&c.chasmEngine),
 			fx.Populate(&c.chasmVisibilityMgr),
 			fx.Populate(&c.chasmRegistry),
+			memberbased.Module,
 		)
 		err := app.Err()
 		if err != nil {
@@ -589,6 +593,7 @@ func (c *TemporalImpl) startMatching() {
 			chasm.Module,
 			chasmtests.Module,
 			fx.Populate(&namespaceRegistry),
+			memberbased.Module,
 		)
 		err := app.Err()
 		if err != nil {
@@ -657,6 +662,7 @@ func (c *TemporalImpl) startWorker() {
 			chasm.Module,
 			chasmtests.Module,
 			fx.Populate(&namespaceRegistry),
+			memberbased.Module,
 		)
 		err := app.Err()
 		if err != nil {
@@ -862,6 +868,7 @@ func (p *clientFactoryProvider) NewFactory(
 	numberOfHistoryShards int32,
 	logger log.Logger,
 	throttledLogger log.Logger,
+	historyShardWatcher ownership.HistoryShardWatcher,
 ) client.Factory {
 	f := client.NewFactoryProvider().NewFactory(
 		rpcFactory,
@@ -872,6 +879,7 @@ func (p *clientFactoryProvider) NewFactory(
 		numberOfHistoryShards,
 		logger,
 		throttledLogger,
+		historyShardWatcher,
 	)
 	return &clientFactory{
 		Factory:         f,

@@ -19,7 +19,6 @@ import (
 	persistencespb "go.temporal.io/server/api/persistence/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/cluster"
-	"go.temporal.io/server/common/convert"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/goro"
 	"go.temporal.io/server/common/log"
@@ -27,6 +26,7 @@ import (
 	"go.temporal.io/server/common/membership"
 	"go.temporal.io/server/common/metrics"
 	"go.temporal.io/server/common/metrics/metricstest"
+	pownership "go.temporal.io/server/common/ownership"
 	"go.temporal.io/server/common/persistence"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/primitives/timestamp"
@@ -48,7 +48,7 @@ type (
 		mockResource        *resourcetest.Test
 		mockHistoryEngine   *historyi.MockEngine
 		mockClusterMetadata *cluster.MockMetadata
-		mockServiceResolver *membership.MockServiceResolver
+		mockShardWatcher    *pownership.MockHistoryShardWatcher
 
 		hostInfo          membership.HostInfo
 		otherHostInfo     membership.HostInfo
@@ -96,7 +96,8 @@ func NewTestController(
 	return ControllerProvider(
 		config,
 		resource.GetLogger(),
-		resource.GetHistoryServiceResolver(),
+		resource.GetHistoryShardWatcher(),
+		resource.GetHistoryShardStatusReporter(),
 		metricsTestHandler,
 		resource.GetHostInfoProvider(),
 		contextFactory,
@@ -117,7 +118,7 @@ func (s *controllerSuite) SetupTest() {
 	s.mockEngineFactory = NewMockEngineFactory(s.controller)
 
 	s.mockShardManager = s.mockResource.ShardMgr
-	s.mockServiceResolver = s.mockResource.HistoryServiceResolver
+	s.mockShardWatcher = s.mockResource.HistoryShardWatcher
 	s.mockClusterMetadata = s.mockResource.ClusterMetadata
 	s.hostInfo = s.mockResource.GetHostInfo()
 	s.otherHostInfo = membership.NewHostInfoFromAddress("other")
@@ -162,7 +163,7 @@ func (s *controllerSuite) TestAcquireShardSuccess() {
 			s.setupMocksForAcquireShard(shardID, mockEngine, 5, 6, true)
 		} else {
 			ownerHost := fmt.Sprintf("test-acquire-shard-host-%v", hostID)
-			s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(membership.NewHostInfoFromAddress(ownerHost), nil)
+			s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: ownerHost}, nil)
 		}
 	}
 
@@ -198,9 +199,7 @@ func (s *controllerSuite) TestAcquireShardsConcurrently() {
 			s.setupMocksForAcquireShard(shardID, mockEngine, 5, 6, true)
 		} else {
 			ownerHost := fmt.Sprintf("test-acquire-shard-host-%v", hostID)
-			s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(
-				membership.NewHostInfoFromAddress(ownerHost), nil,
-			)
+			s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: ownerHost}, nil)
 		}
 	}
 
@@ -222,12 +221,12 @@ func (s *controllerSuite) TestAcquireShardLookupFailure() {
 	numShards := int32(2)
 	s.config.NumberOfShards = numShards
 	for shardID := int32(1); shardID <= numShards; shardID++ {
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(nil, errors.New("ring failure"))
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{}, errors.New("ownership failure"))
 	}
 
 	s.shardController.acquireShards(context.Background())
 	for shardID := int32(1); shardID <= numShards; shardID++ {
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(nil, errors.New("ring failure"))
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{}, errors.New("ownership failure"))
 		shard, err := s.shardController.GetShardByID(shardID)
 		s.Error(err)
 		s.Nil(shard)
@@ -248,7 +247,7 @@ func (s *controllerSuite) TestAcquireShardRenewSuccess() {
 	s.shardController.acquireShards(context.Background())
 
 	for shardID := int32(1); shardID <= numShards; shardID++ {
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil)
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil)
 	}
 	s.shardController.acquireShards(context.Background())
 
@@ -278,7 +277,7 @@ func (s *controllerSuite) TestAcquireShardRenewLookupFailed() {
 	s.shardController.acquireShards(context.Background())
 
 	for shardID := int32(1); shardID <= numShards; shardID++ {
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(nil, errors.New("ring failure"))
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{}, errors.New("ownership failure"))
 	}
 	s.shardController.acquireShards(context.Background())
 
@@ -314,8 +313,7 @@ func (s *controllerSuite) TestHistoryEngineClosed() {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	s.mockServiceResolver.EXPECT().AddListener(shardControllerMembershipUpdateListenerName,
-		gomock.Any()).Return(nil).AnyTimes()
+	s.mockShardWatcher.EXPECT().AcquireNotifyChannel().Return(nil, func() {}).AnyTimes()
 	s.shardController.Start()
 	s.shardController.acquireShards(context.Background())
 
@@ -342,7 +340,7 @@ func (s *controllerSuite) TestHistoryEngineClosed() {
 	for shardID := int32(1); shardID <= 2; shardID++ {
 		mockEngine := historyEngines[shardID]
 		mockEngine.EXPECT().Stop().Return()
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.otherHostInfo, nil).AnyTimes()
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.otherHostInfo.GetAddress()}, nil).AnyTimes()
 		s.shardController.CloseShardByID(shardID)
 	}
 
@@ -386,11 +384,10 @@ func (s *controllerSuite) TestHistoryEngineClosed() {
 
 	workerWG.Wait()
 
-	s.mockServiceResolver.EXPECT().RemoveListener(shardControllerMembershipUpdateListenerName).Return(nil).AnyTimes()
 	for shardID := int32(3); shardID <= numShards; shardID++ {
 		mockEngine := historyEngines[shardID]
 		mockEngine.EXPECT().Stop().Return()
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil).AnyTimes()
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil).AnyTimes()
 	}
 	s.shardController.Stop()
 }
@@ -413,7 +410,7 @@ func (s *controllerSuite) TestShardControllerClosed() {
 		s.setupMocksForAcquireShard(shardID, mockEngine, 5, 6, true)
 	}
 
-	s.mockServiceResolver.EXPECT().AddListener(shardControllerMembershipUpdateListenerName, gomock.Any()).Return(nil).AnyTimes()
+	s.mockShardWatcher.EXPECT().AcquireNotifyChannel().Return(nil, func() {}).AnyTimes()
 	s.shardController.Start()
 	s.shardController.acquireShards(context.Background())
 
@@ -438,11 +435,10 @@ func (s *controllerSuite) TestShardControllerClosed() {
 		}()
 	}
 
-	s.mockServiceResolver.EXPECT().RemoveListener(shardControllerMembershipUpdateListenerName).Return(nil).AnyTimes()
 	for shardID := int32(1); shardID <= numShards; shardID++ {
 		mockEngine := historyEngines[shardID]
 		mockEngine.EXPECT().Stop()
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil).AnyTimes()
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil).AnyTimes()
 	}
 	s.shardController.Stop()
 	workerWG.Wait()
@@ -476,7 +472,7 @@ func (s *controllerSuite) TestShardExplicitUnloadCancelGetOrCreate() {
 	mockEngine.EXPECT().Stop().AnyTimes()
 
 	shardID := int32(1)
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil)
 
 	ready := make(chan struct{})
 	wasCanceled := make(chan bool)
@@ -517,7 +513,7 @@ func (s *controllerSuite) TestShardExplicitUnloadCancelAcquire() {
 	mockEngine.EXPECT().Stop().AnyTimes()
 
 	shardID := int32(1)
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil)
 	// return success from GetOrCreateShard
 	s.mockShardManager.EXPECT().GetOrCreateShard(gomock.Any(), getOrCreateShardRequestMatcher(shardID)).Return(
 		&persistence.GetOrCreateShardResponse{
@@ -567,8 +563,7 @@ func (s *controllerSuite) TestShardExplicitUnloadCancelAcquire() {
 func (s *controllerSuite) TestShardControllerFuzz() {
 	s.config.NumberOfShards = 10
 
-	s.mockServiceResolver.EXPECT().AddListener(shardControllerMembershipUpdateListenerName, gomock.Any()).Return(nil).AnyTimes()
-	s.mockServiceResolver.EXPECT().RemoveListener(shardControllerMembershipUpdateListenerName).Return(nil).AnyTimes()
+	s.mockShardWatcher.EXPECT().AcquireNotifyChannel().Return(nil, func() {}).AnyTimes()
 
 	// only for MockEngines: we just need to hook Start/Stop, not verify calls
 	disconnectedMockController := gomock.NewController(nil)
@@ -580,7 +575,7 @@ func (s *controllerSuite) TestShardControllerFuzz() {
 		shardID := shardID
 		queueStates := s.queueStates()
 
-		s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil).AnyTimes()
+		s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil).AnyTimes()
 		s.mockEngineFactory.EXPECT().CreateEngine(contextMatcher(shardID)).DoAndReturn(func(shard historyi.ShardContext) historyi.Engine {
 			mockEngine := historyi.NewMockEngine(disconnectedMockController)
 			status := new(int32)
@@ -727,8 +722,7 @@ func (s *controllerSuite) TestShardLingerTimeout() {
 	shard, err := s.shardController.getOrCreateShardContext(shardID)
 	s.NoError(err)
 
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).
-		Return(membership.NewHostInfoFromAddress("newhost"), nil)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: "newhost"}, nil)
 
 	mockEngine.EXPECT().Stop().Return()
 
@@ -765,7 +759,9 @@ func (s *controllerSuite) TestShardLingerSuccess() {
 
 	mockEngine.EXPECT().Start().MinTimes(1)
 	mockEngine.EXPECT().NotifyNewTasks(gomock.Any()).MaxTimes(2)
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil).Times(2).MinTimes(1)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).
+		Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil).
+		Times(2).MinTimes(1)
 	s.mockEngineFactory.EXPECT().CreateEngine(contextMatcher(shardID)).Return(mockEngine).MinTimes(1)
 	s.mockShardManager.EXPECT().GetOrCreateShard(gomock.Any(), getOrCreateShardRequestMatcher(shardID)).Return(
 		&persistence.GetOrCreateShardResponse{
@@ -798,8 +794,7 @@ func (s *controllerSuite) TestShardLingerSuccess() {
 	shard, err := s.shardController.getOrCreateShardContext(shardID)
 	s.NoError(err)
 
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).
-		Return(membership.NewHostInfoFromAddress("newhost"), nil)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: "newhost"}, nil)
 
 	mockEngine.EXPECT().Stop().Return().MinTimes(1)
 
@@ -833,13 +828,11 @@ func (s *controllerSuite) TestShardCounter() {
 	s.config.NumberOfShards = totalShards
 
 	var ownedShards atomic.Int32
-	s.mockServiceResolver.EXPECT().Lookup(gomock.Any()).DoAndReturn(func(key string) (membership.HostInfo, error) {
-		if i, err := strconv.Atoi(key); err != nil {
-			return nil, err
-		} else if i <= int(ownedShards.Load()) {
-			return s.hostInfo, nil
+	s.mockShardWatcher.EXPECT().OwnershipStatus(gomock.Any()).DoAndReturn(func(shardID int32) (pownership.Status, error) {
+		if shardID <= ownedShards.Load() {
+			return pownership.Status{Owner: s.hostInfo.GetAddress()}, nil
 		}
-		return s.otherHostInfo, nil
+		return pownership.Status{Owner: s.otherHostInfo.GetAddress()}, nil
 	}).AnyTimes()
 
 	mockEngine := historyi.NewMockEngine(s.controller)
@@ -891,13 +884,12 @@ func (s *controllerSuite) setupMocksForReadiness() *readinessMockState {
 
 	s.config.NumberOfShards = 5
 
-	s.mockServiceResolver.EXPECT().Lookup(gomock.Any()).DoAndReturn(func(key string) (membership.HostInfo, error) {
-		if i, err := strconv.Atoi(key); err != nil {
-			return nil, err
-		} else if owned, ok := state.ownership.Load(i); ok && owned.(bool) {
-			return s.hostInfo, nil
+	s.mockShardWatcher.EXPECT().OwnershipStatus(gomock.Any()).DoAndReturn(func(shardID int32) (pownership.Status, error) {
+		i := int(shardID)
+		if owned, ok := state.ownership.Load(i); ok && owned.(bool) {
+			return pownership.Status{Owner: s.hostInfo.GetAddress()}, nil
 		}
-		return s.otherHostInfo, nil
+		return pownership.Status{Owner: s.otherHostInfo.GetAddress()}, nil
 	}).AnyTimes()
 
 	state.ownership.Range(func(shardID, owned any) bool {
@@ -1066,7 +1058,7 @@ func (s *controllerSuite) setupMocksForAcquireShard(
 	mockEngine.EXPECT().Start().MinTimes(minTimes)
 	// notification step is done after engine is created, so may not be called when test finishes
 	mockEngine.EXPECT().NotifyNewTasks(gomock.Any()).MaxTimes(2)
-	s.mockServiceResolver.EXPECT().Lookup(convert.Int32ToString(shardID)).Return(s.hostInfo, nil).Times(2).MinTimes(minTimes)
+	s.mockShardWatcher.EXPECT().OwnershipStatus(shardID).Return(pownership.Status{Owner: s.hostInfo.GetAddress()}, nil).Times(2).MinTimes(minTimes)
 	s.mockEngineFactory.EXPECT().CreateEngine(contextMatcher(shardID)).Return(mockEngine).MinTimes(minTimes)
 	s.mockShardManager.EXPECT().GetOrCreateShard(gomock.Any(), getOrCreateShardRequestMatcher(shardID)).Return(
 		&persistence.GetOrCreateShardResponse{
