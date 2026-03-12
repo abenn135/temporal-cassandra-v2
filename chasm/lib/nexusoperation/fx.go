@@ -43,6 +43,11 @@ var Module = fx.Module(
 	fx.Invoke(register),
 )
 
+var FrontendModule = fx.Module(
+	"chasm.lib.nexusoperation.frontend",
+	fx.Provide(NewFrontendHandler),
+)
+
 func register(
 	registry *chasm.Registry,
 	library *Library,
