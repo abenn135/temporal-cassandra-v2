@@ -82,11 +82,11 @@ func (s *ActivityAPIPauseClientTestSuite) TestActivityPauseApi_WhileRunning() {
 	s.NoError(err)
 
 	// wait for activity to start
-	s.EventuallyWithT(func(t *assert.CollectT) {
+	s.Await(func(s *ActivityAPIPauseClientTestSuite) {
 		description, err := env.SdkClient().DescribeWorkflowExecution(ctx, workflowRun.GetID(), workflowRun.GetRunID())
-		require.NoError(t, err)
-		require.Len(t, description.PendingActivities, 1)
-		require.Equal(t, int32(1), startedActivityCount.Load())
+		s.NoError(err)
+		s.Len(description.PendingActivities, 1)
+		s.Equal(int32(1), startedActivityCount.Load())
 	}, 5*time.Second, 500*time.Millisecond)
 
 	// pause activity
