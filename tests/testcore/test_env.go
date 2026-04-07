@@ -18,6 +18,7 @@ import (
 	sdkclient "go.temporal.io/sdk/client"
 	sdkworker "go.temporal.io/sdk/worker"
 	"go.temporal.io/server/api/adminservice/v1"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/debug"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
@@ -71,6 +72,7 @@ type TestEnv struct {
 	t          *testing.T
 	tv         *testvars.TestVars
 	ctx        context.Context
+	dedicated  *dedicatedClusterUsageTracker
 
 	sdkClientOnce sync.Once
 	sdkClient     sdkclient.Client
@@ -83,6 +85,7 @@ type TestOption func(*testOptions)
 
 type testOptions struct {
 	dedicatedCluster      bool
+	explicitlyDedicated   bool
 	dynamicConfigSettings []dynamicConfigOverride
 	timeout               time.Duration
 }
@@ -97,6 +100,7 @@ type dynamicConfigOverride struct {
 func WithDedicatedCluster() TestOption {
 	return func(o *testOptions) {
 		o.dedicatedCluster = true
+		o.explicitlyDedicated = true
 	}
 }
 
@@ -141,12 +145,16 @@ func NewEnv(t *testing.T, opts ...TestOption) *TestEnv {
 	for _, opt := range opts {
 		opt(&options)
 	}
+	dedicatedUsage := newDedicatedClusterUsageTracker(options.explicitlyDedicated)
 
 	// For dedicated clusters, pass all dynamic config settings at cluster creation.
 	var startupConfig map[dynamicconfig.Key]any
 	if options.dedicatedCluster && len(options.dynamicConfigSettings) > 0 {
 		startupConfig = make(map[dynamicconfig.Key]any, len(options.dynamicConfigSettings))
 		for _, override := range options.dynamicConfigSettings {
+			if !canBeNamespaceScoped(override.setting.Precedence()) {
+				dedicatedUsage.markUsed("non-namespace/taskqueue-scoped dynamic config")
+			}
 			startupConfig[override.setting.Key()] = override.value
 		}
 	}
@@ -180,7 +188,17 @@ func NewEnv(t *testing.T, opts ...TestOption) *TestEnv {
 		tv:                 testvars.New(t),
 		ctx:                setupTestTimeoutWithContext(t, options.timeout),
 		sdkWorkerTQ:        RandomizeStr("tq-" + t.Name()),
+		dedicated:          dedicatedUsage,
 	}
+	t.Cleanup(func() {
+		if err := env.dedicated.unusedError(); err != nil {
+			if t.Failed() {
+				t.Log(err.Error())
+				return
+			}
+			panic(err)
+		}
+	})
 
 	// For shared clusters, apply all dynamic config settings as overrides.
 	if !options.dedicatedCluster && len(options.dynamicConfigSettings) > 0 {
@@ -201,6 +219,10 @@ func (e *TestEnv) NamespaceID() namespace.ID {
 	return e.nsID
 }
 
+func (e *TestEnv) markDedicatedUse(reason string) {
+	e.dedicated.markUsed(reason)
+}
+
 // InjectHook sets a test hook inside the cluster.
 //
 // It auto-detects the scope from the hook:
@@ -215,6 +237,7 @@ func (e *TestEnv) InjectHook(hook testhooks.Hook) (cleanup func()) {
 		if e.isShared {
 			e.t.Fatal("InjectHook: global hooks require a dedicated cluster; use testcore.WithDedicatedCluster()")
 		}
+		e.markDedicatedUse("global hook")
 		scope = testhooks.GlobalScope
 	default:
 		e.t.Fatalf("InjectHook: unknown scope %v", hook.Scope())
@@ -340,8 +363,24 @@ func (e *TestEnv) OverrideDynamicConfig(setting dynamicconfig.GenericSetting, va
 				Value:       value,
 			}}
 		}
+	} else if !canBeNamespaceScoped(setting.Precedence()) {
+		e.markDedicatedUse("non-namespace/taskqueue-scoped dynamic config")
 	}
 	return e.cluster.host.overrideDynamicConfig(e.t, setting.Key(), value)
+}
+
+// CloseShard closes the shard that contains the given workflow.
+// This is a cluster-global operation and cannot be called on shared clusters.
+func (e *TestEnv) CloseShard(namespaceID string, workflowID string) {
+	if e.isShared {
+		e.t.Fatalf("CloseShard cannot be called on a shared cluster; use testcore.WithDedicatedCluster()")
+	}
+	e.markDedicatedUse("CloseShard")
+	shardID := common.WorkflowIDToHistoryShard(namespaceID, workflowID, e.testClusterConfig.HistoryConfig.NumHistoryShards)
+	_, err := e.AdminClient().CloseShard(NewContext(), &adminservice.CloseShardRequest{
+		ShardId: shardID,
+	})
+	e.NoError(err)
 }
 
 func canBeNamespaceScoped(p dynamicconfig.Precedence) bool {
@@ -378,4 +417,41 @@ func checkTestShard(t *testing.T) {
 		t.Skipf("Skipping %s in test shard %d/%d (it runs in %d)", t.Name(), index+1, total, testIndex+1)
 	}
 	t.Logf("Running %s in test shard %d/%d", t.Name(), index+1, total)
+}
+
+type dedicatedClusterUsageTracker struct {
+	explicitlyRequested bool
+	mu                  sync.Mutex
+	firstUseReason      string
+}
+
+func newDedicatedClusterUsageTracker(explicitlyRequested bool) *dedicatedClusterUsageTracker {
+	return &dedicatedClusterUsageTracker{explicitlyRequested: explicitlyRequested}
+}
+
+func (u *dedicatedClusterUsageTracker) markUsed(reason string) {
+	if !u.explicitlyRequested {
+		return
+	}
+	u.mu.Lock()
+	if u.firstUseReason == "" {
+		u.firstUseReason = reason
+	}
+	u.mu.Unlock()
+}
+
+func (u *dedicatedClusterUsageTracker) unusedError() error {
+	if !u.explicitlyRequested {
+		return nil
+	}
+	u.mu.Lock()
+	firstUseReason := u.firstUseReason
+	u.mu.Unlock()
+	if firstUseReason == "" {
+		return fmt.Errorf(
+			"testcore.WithDedicatedCluster() was requested but no dedicated-cluster-only feature was used (firstUseReason=%q)",
+			firstUseReason,
+		)
+	}
+	return nil
 }
