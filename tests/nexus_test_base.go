@@ -57,6 +57,10 @@ func (env *NexusTestEnv) createNexusEndpoint(t *testing.T, name string, taskQueu
 	return resp.Endpoint
 }
 
+func (env *NexusTestEnv) createRandomNexusEndpoint(t *testing.T) *nexuspb.Endpoint {
+	return env.createNexusEndpoint(t, testcore.RandomizedNexusEndpoint(t.Name()), "unused")
+}
+
 // nexusTaskResponse represents a successful response from a nexus task handler.
 // A nil response indicates no response should be sent (e.g., handler timed out).
 type nexusTaskResponse struct {
