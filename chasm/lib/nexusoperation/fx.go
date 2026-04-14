@@ -47,6 +47,7 @@ var Module = fx.Module(
 
 var FrontendModule = fx.Module(
 	"chasm.lib.nexusoperation.frontend",
+	fx.Provide(configProvider),
 	fx.Provide(nexusoperationpb.NewNexusOperationServiceLayeredClient),
 	fx.Provide(NewFrontendHandler),
 )

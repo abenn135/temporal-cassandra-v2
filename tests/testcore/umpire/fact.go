@@ -2,8 +2,8 @@ package umpire
 
 import "fmt"
 
-// Fact is implemented by domain-specific event types.
-// Each concrete type represents a specific kind of observed traffic event.
+// Fact is implemented by domain-specific observed facts.
+// Each concrete type represents a specific kind of recorded observation.
 type Fact interface {
 	// Key returns the entity key this fact relates to (e.g. operation ID).
 	Key() string

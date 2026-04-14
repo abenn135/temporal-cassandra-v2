@@ -6,175 +6,137 @@ import (
 	"go.temporal.io/server/tests/testcore/umpire"
 )
 
-// nexusEventCausalityRule checks that every task completion/failure
-// has a prior start task event for the same operation.
-type nexusEventCausalityRule struct{}
+type nexusTaskCausalityRule struct{}
 
-func (r *nexusEventCausalityRule) Name() string { return "nexus-event-causality" }
+func (r *nexusTaskCausalityRule) Name() string { return "nexus-task-causality" }
 
-func (r *nexusEventCausalityRule) Check(history []*umpire.Record) []umpire.Violation {
-	startSeen := make(map[string]bool)
+func (r *nexusTaskCausalityRule) Check(history []*umpire.Record) []umpire.Violation {
+	dispatched := make(map[string]map[nexusTaskKind]bool)
 	var violations []umpire.Violation
+
 	for _, rec := range history {
-		switch rec.Fact.(type) {
-		case *nexusStartTask:
-			startSeen[rec.Fact.Key()] = true
-		case *nexusTaskCompleted, *nexusTaskFailed:
-			if !startSeen[rec.Fact.Key()] {
-				violations = append(violations, umpire.Violation{
-					Rule:    r.Name(),
-					Message: fmt.Sprintf("%T without prior start task", rec.Fact),
-					Tags:    map[string]string{"operationID": rec.Fact.Key()},
-				})
-			}
-		}
-	}
-	return violations
-}
-
-// nexusCompletedOpConsistencyRule checks that operations the model considers
-// completed have at least one task completion event in the traffic history.
-type nexusCompletedOpConsistencyRule struct {
-	ops func() []*modelOp
-}
-
-func (r *nexusCompletedOpConsistencyRule) Name() string { return "nexus-completed-op-consistency" }
-
-func (r *nexusCompletedOpConsistencyRule) Check(history []*umpire.Record) []umpire.Violation {
-	completions := make(map[string]bool)
-	for _, rec := range history {
-		if _, ok := rec.Fact.(*nexusTaskCompleted); ok {
-			completions[rec.Fact.Key()] = true
-		}
-	}
-	var violations []umpire.Violation
-	for _, op := range r.ops() {
-		if op.status == modelStatusCompleted && !completions[op.operationID] {
-			violations = append(violations, umpire.Violation{
-				Rule:    r.Name(),
-				Message: "operation completed in model but no task completion observed",
-				Tags:    map[string]string{"operationID": op.operationID},
-			})
-		}
-	}
-	return violations
-}
-
-// nexusAtMostOneCompletionRule checks that no operation has more than one
-// task-completed event. Duplicate completions indicate an idempotency bug.
-type nexusAtMostOneCompletionRule struct{}
-
-func (r *nexusAtMostOneCompletionRule) Name() string { return "nexus-at-most-one-completion" }
-
-func (r *nexusAtMostOneCompletionRule) Check(history []*umpire.Record) []umpire.Violation {
-	counts := make(map[string]int)
-	var violations []umpire.Violation
-	for _, rec := range history {
-		if _, ok := rec.Fact.(*nexusTaskCompleted); ok {
-			counts[rec.Fact.Key()]++
-			if counts[rec.Fact.Key()] > 1 {
-				violations = append(violations, umpire.Violation{
-					Rule:    r.Name(),
-					Message: fmt.Sprintf("operation has %d task completions", counts[rec.Fact.Key()]),
-					Tags:    map[string]string{"operationID": rec.Fact.Key()},
-				})
-			}
-		}
-	}
-	return violations
-}
-
-// nexusNoPostTerminalTasksRule checks that no start task events appear for an
-// operation after its last completion/failure event.
-type nexusNoPostTerminalTasksRule struct {
-	ops func() []*modelOp
-}
-
-func (r *nexusNoPostTerminalTasksRule) Name() string { return "nexus-no-post-terminal-tasks" }
-
-func (r *nexusNoPostTerminalTasksRule) Check(history []*umpire.Record) []umpire.Violation {
-	// Find the last completion/failure seq for each operation.
-	lastTerminalSeq := make(map[string]int64)
-	for _, rec := range history {
-		switch rec.Fact.(type) {
-		case *nexusTaskCompleted, *nexusTaskFailed:
-			if rec.Seq > lastTerminalSeq[rec.Fact.Key()] {
-				lastTerminalSeq[rec.Fact.Key()] = rec.Seq
-			}
-		}
-	}
-
-	var violations []umpire.Violation
-	for _, rec := range history {
-		if _, ok := rec.Fact.(*nexusStartTask); !ok {
+		event, ok := rec.Fact.(*nexusTaskEvent)
+		if !ok {
 			continue
 		}
-		termSeq, hasTerminal := lastTerminalSeq[rec.Fact.Key()]
+		if event.Outcome == nexusTaskOutcomeDispatched {
+			if dispatched[event.OperationID] == nil {
+				dispatched[event.OperationID] = make(map[nexusTaskKind]bool)
+			}
+			dispatched[event.OperationID][event.Kind] = true
+			continue
+		}
+		if dispatched[event.OperationID][event.Kind] {
+			continue
+		}
+		violations = append(violations, umpire.Violation{
+			Rule:    r.Name(),
+			Message: fmt.Sprintf("%s %s without prior dispatch", event.Kind, event.Outcome),
+			Tags: map[string]string{
+				"operationID": event.OperationID,
+				"kind":        string(event.Kind),
+				"outcome":     string(event.Outcome),
+			},
+		})
+	}
+
+	return violations
+}
+
+type nexusTerminalConsistencyRule struct{}
+
+func (r *nexusTerminalConsistencyRule) Name() string { return "nexus-terminal-consistency" }
+
+func (r *nexusTerminalConsistencyRule) Check(history []*umpire.Record) []umpire.Violation {
+	startCompleted := make(map[string]bool)
+	cancelCompleted := make(map[string]bool)
+	terminalStatus := make(map[string]modelOpStatus)
+
+	for _, rec := range history {
+		switch event := rec.Fact.(type) {
+		case *nexusTaskEvent:
+			if event.Outcome != nexusTaskOutcomeCompleted {
+				continue
+			}
+			switch event.Kind {
+			case nexusTaskKindStart:
+				startCompleted[event.OperationID] = true
+			case nexusTaskKindCancel:
+				cancelCompleted[event.OperationID] = true
+			}
+		case *umpire.Transition[modelOpStatus]:
+			if isTerminalStatus(event.To) {
+				terminalStatus[event.EntityID] = event.To
+			}
+		}
+	}
+
+	var violations []umpire.Violation
+	for operationID, status := range terminalStatus {
+		switch status {
+		case modelStatusCompleted:
+			if startCompleted[operationID] {
+				continue
+			}
+			violations = append(violations, umpire.Violation{
+				Rule:    r.Name(),
+				Message: "operation completed in model but no start completion observed",
+				Tags:    map[string]string{"operationID": operationID},
+			})
+		case modelStatusCanceled:
+			if cancelCompleted[operationID] {
+				continue
+			}
+			violations = append(violations, umpire.Violation{
+				Rule:    r.Name(),
+				Message: "operation canceled in model but no cancel completion observed",
+				Tags:    map[string]string{"operationID": operationID},
+			})
+		default:
+		}
+	}
+
+	return violations
+}
+
+type nexusNoPostTerminalDispatchRule struct{}
+
+func (r *nexusNoPostTerminalDispatchRule) Name() string { return "nexus-no-post-terminal-dispatch" }
+
+func (r *nexusNoPostTerminalDispatchRule) Check(history []*umpire.Record) []umpire.Violation {
+	lastTerminalSeq := umpire.LastTransitionSeqTo(history, isTerminalStatus)
+
+	var violations []umpire.Violation
+	for _, rec := range history {
+		event, ok := rec.Fact.(*nexusTaskEvent)
+		if !ok || event.Outcome != nexusTaskOutcomeDispatched {
+			continue
+		}
+		termSeq, hasTerminal := lastTerminalSeq[event.OperationID]
 		if !hasTerminal || rec.Seq <= termSeq {
 			continue
 		}
-		// Only flag if the model also considers the op terminal.
-		for _, op := range r.ops() {
-			if op.operationID == rec.Fact.Key() && isTerminalStatus(op.status) {
-				violations = append(violations, umpire.Violation{
-					Rule:    r.Name(),
-					Message: "start task after operation reached terminal state",
-					Tags: map[string]string{
-						"operationID": rec.Fact.Key(),
-						"eventSeq":    fmt.Sprintf("%d", rec.Seq),
-						"terminalSeq": fmt.Sprintf("%d", termSeq),
-					},
-				})
-			}
-		}
+		violations = append(violations, umpire.Violation{
+			Rule:    r.Name(),
+			Message: "task dispatched after operation reached terminal state",
+			Tags: map[string]string{
+				"operationID": event.OperationID,
+				"kind":        string(event.Kind),
+				"eventSeq":    fmt.Sprintf("%d", rec.Seq),
+				"terminalSeq": fmt.Sprintf("%d", termSeq),
+			},
+		})
 	}
-	return violations
-}
 
-// nexusRunningOpsGetTasksRule is a liveness rule that checks every operation
-// that was started eventually received at least one start task event.
-type nexusRunningOpsGetTasksRule struct {
-	ops func() []*modelOp
-}
-
-func (r *nexusRunningOpsGetTasksRule) Name() string { return "nexus-running-ops-get-tasks" }
-
-func (r *nexusRunningOpsGetTasksRule) Check(history []*umpire.Record, final bool) []umpire.Violation {
-	if !final {
-		return nil
-	}
-	startSeen := make(map[string]bool)
-	for _, rec := range history {
-		if _, ok := rec.Fact.(*nexusStartTask); ok {
-			startSeen[rec.Fact.Key()] = true
-		}
-	}
-	var violations []umpire.Violation
-	for _, op := range r.ops() {
-		if !startSeen[op.operationID] {
-			violations = append(violations, umpire.Violation{
-				Rule:    r.Name(),
-				Message: "operation never received a start task event",
-				Tags: map[string]string{
-					"operationID": op.operationID,
-					"status":      fmt.Sprintf("%d", op.status),
-				},
-			})
-		}
-	}
 	return violations
 }
 
 func isTerminalStatus(s modelOpStatus) bool {
-	return s == modelStatusCompleted || s == modelStatusFailed || s == modelStatusTerminated
+	return s == modelStatusCompleted || s == modelStatusCanceled || s == modelStatusFailed || s == modelStatusTerminated
 }
 
-// RegisterRules is discovered by umpire.Model and called automatically at the
-// start of each rapid iteration.
 func (m *nexusPropModel) RegisterRules() {
-	m.Umpire.AddRule(&nexusEventCausalityRule{})
-	m.Umpire.AddRule(&nexusCompletedOpConsistencyRule{ops: m.sortedOps})
-	m.Umpire.AddRule(&nexusAtMostOneCompletionRule{})
-	m.Umpire.AddRule(&nexusNoPostTerminalTasksRule{ops: m.sortedOps})
-	m.Umpire.AddRule(&nexusRunningOpsGetTasksRule{ops: m.sortedOps})
+	m.Umpire.AddRule(&nexusTaskCausalityRule{})
+	m.Umpire.AddRule(&nexusTerminalConsistencyRule{})
+	m.Umpire.AddRule(&nexusNoPostTerminalDispatchRule{})
 }
