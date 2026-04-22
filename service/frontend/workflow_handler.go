@@ -2792,6 +2792,9 @@ func (wh *WorkflowHandler) ListWorkflowExecutions(ctx context.Context, request *
 		return nil, err
 	}
 
+	metricsHandler := wh.metricsScope(ctx).WithTags(metrics.HeaderCallsiteTag("ListWorkflowExecutions"))
+	metrics.VisibilityListWorkflowExecutionsQueryLength.With(metricsHandler).Record(int64(len(request.GetQuery())))
+
 	req := &manager.ListWorkflowExecutionsRequestV2{
 		NamespaceID:   namespaceID,
 		Namespace:     namespaceName,

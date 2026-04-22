@@ -757,6 +757,8 @@ var (
 	NamespaceHostRPSLimit = NewGaugeDef("namespace_host_rps_limit")
 	HandoverWaitLatency   = NewTimerDef("handover_wait_latency")
 
+	VisibilityListWorkflowExecutionsQueryLength = NewDimensionlessHistogramDef("visibility_list_workflows_query_length")
+
 	// History
 	CacheRequests                                = NewCounterDef("cache_requests")
 	CacheFailures                                = NewCounterDef("cache_errors")
