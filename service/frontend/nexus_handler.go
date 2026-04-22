@@ -106,6 +106,9 @@ func (c *operationContext) capturePanicAndRecordMetrics(ctxPtr *context.Context,
 	// Record Nexus-specific metrics
 	metrics.NexusRequests.With(c.metricsHandler).Record(1)
 	metrics.NexusLatency.With(c.metricsHandler).Record(time.Since(c.requestStartTime))
+	if *errPtr != nil {
+		metrics.NexusRequestErrors.With(c.metricsHandler).Record(1)
+	}
 
 	// Record general telemetry metrics
 	metrics.ServiceRequests.With(c.metricsHandlerForInterceptors).Record(1)
@@ -281,7 +284,7 @@ func (c *operationContext) shouldForwardRequest(ctx context.Context, header nexu
 }
 
 // enrichNexusOperationMetrics enhances metrics with additional Nexus operation context based on configuration.
-func (c *operationContext) enrichNexusOperationMetrics(service, operation string, requestHeader nexus.Header) {
+func (c *operationContext) enrichNexusOperationMetrics(ctx context.Context, service, operation string, requestHeader nexus.Header) {
 	conf := c.metricTagConfig()
 
 	var tags []metrics.Tag
@@ -297,6 +300,12 @@ func (c *operationContext) enrichNexusOperationMetrics(service, operation string
 	for _, mapping := range conf.HeaderTagMappings {
 		tags = append(tags, metrics.StringTag(mapping.TargetTag, requestHeader.Get(mapping.SourceHeader)))
 	}
+
+	// Add caller tags from the context.
+	callerInfo := headers.GetCallerInfo(ctx)
+	tags = append(tags, metrics.NexusCallerTag(callerInfo.CallerName))
+	// Namespace is the only valid caller_type. To be updated when there are more kinds
+	tags = append(tags, metrics.NexusCallerTypeTag("namespace"))
 
 	if len(tags) > 0 {
 		c.metricsHandler = c.metricsHandler.WithTags(tags...)
@@ -391,7 +400,7 @@ func (h *nexusHandler) StartOperation(
 		return nil, err
 	}
 	ctx = oc.augmentContext(ctx, options.Header)
-	oc.enrichNexusOperationMetrics(service, operation, options.Header)
+	oc.enrichNexusOperationMetrics(ctx, service, operation, options.Header)
 	defer oc.capturePanicAndRecordMetrics(&ctx, &retErr)
 
 	var links []*nexuspb.Link
@@ -629,7 +638,7 @@ func (h *nexusHandler) CancelOperation(ctx context.Context, service, operation, 
 		return err
 	}
 	ctx = oc.augmentContext(ctx, options.Header)
-	oc.enrichNexusOperationMetrics(service, operation, options.Header)
+	oc.enrichNexusOperationMetrics(ctx, service, operation, options.Header)
 	defer oc.capturePanicAndRecordMetrics(&ctx, &retErr)
 
 	request := oc.matchingRequest(&nexuspb.Request{
